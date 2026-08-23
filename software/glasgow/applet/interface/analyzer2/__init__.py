@@ -302,11 +302,15 @@ class Reader(wiring.Component):
 
     dram: Out(octoram.Signature())
 
-    i_ranges: In(stream.Signature(data.StructLayout({
-        "addr": 32, # 4-byte aligned
-        "size": 32, # 4-byte multiple
+    i_blocks: In(stream.Signature(data.StructLayout({
+        "skip": 1, # whether to read range contents or only advance the pointer
+        "size": 8, # 4-byte multiple
+        "trig": Packer.TRIG_SHAPE,
     })))
-    o_octets: Out(stream.Signature(8))
+    o_octets: Out(stream.Signature(data.StructLayout({
+        "data": 8,
+        "end":  1,
+    })))
 
     def __init__(self, *, dram_range: range, burst_bytes: int):
         assert dram_range.start % burst_bytes == 0
@@ -327,25 +331,53 @@ class Reader(wiring.Component):
             shape=data.ArrayLayout(8, 2), depth=(self._burst_bytes >> 1) * 2)
         wiring.connect(m, flipped(self.dram.r_data), r_queue.i)
 
-        # Convert 2-byte memory beats into output octets.
-        r_phase = Signal()
-        m.d.comb += [
-            self.o_octets.payload.eq(r_queue.o.payload[r_phase]),
-            self.o_octets.valid.eq(r_queue.o.valid),
-            r_queue.o.ready.eq(self.o_octets.ready & r_phase),
-        ]
-        with m.If(self.o_octets.valid & self.o_octets.ready):
-            m.d.sync += r_phase.eq(~r_phase)
+        # Queue blocks so that trailers can be inserted as appropriate.
+        m.submodules.block_queue = block_queue = Queue(
+            shape=self.i_blocks.p.shape(), depth=2)
+
+        with m.FSM(name="octet_fsm"):
+            # Convert 2-byte memory beats into output octets.
+            with m.State("Data"):
+                r_phase = Signal()
+                r_count = Signal.like(self.i_blocks.p.size)
+                m.d.comb += [
+                    self.o_octets.p.data.eq(r_queue.o.payload[r_phase]),
+                    self.o_octets.valid.eq(block_queue.o.valid & r_queue.o.valid),
+                    r_queue.o.ready.eq(block_queue.o.valid & self.o_octets.ready & r_phase),
+                ]
+                with m.If(self.o_octets.valid & self.o_octets.ready):
+                    m.d.sync += r_phase.eq(~r_phase)
+                    m.d.sync += r_count.eq(r_count + 1)
+                    with m.If(r_count + 1 == block_queue.o.p.size):
+                        m.d.sync += r_count.eq(0)
+                        with m.If(~block_queue.o.p.trig.active):
+                            m.d.comb += block_queue.o.ready.eq(1)
+                        with m.Else():
+                            m.next = "Trailer"
+
+            # Append a trailer and end the stream.
+            with m.State("Trailer"):
+                m.d.comb += self.o_octets.p.data.eq(0x80 | block_queue.o.p.trig.offset)
+                m.d.comb += self.o_octets.valid.eq(1)
+                with m.If(self.o_octets.valid & self.o_octets.ready):
+                    m.d.comb += block_queue.o.ready.eq(1)
+                    m.next = "End"
+
+            with m.State("End"):
+                m.d.comb += self.o_octets.p.end.eq(1)
+                m.d.comb += self.o_octets.valid.eq(1)
+                with m.If(self.o_octets.valid & self.o_octets.ready):
+                    m.next = "Data"
 
         # Issue memory read commands.
-        r_length  = Signal.like(self.i_ranges.p.size)
+        r_length  = Signal.like(self.i_blocks.p.size)
         r_pointer = Signal(self._dram_range)
-        r_active  = Signal()
         r_advance = Signal(range(self._burst_bytes + 1))
-        with m.If(~r_active):
+        r_do_read = Signal()
+        r_do_skip = Signal()
+        with m.If(~(r_do_read | r_do_skip)):
             m.d.sync += r_length.eq(0)
-            m.d.sync += r_pointer.eq(self.i_ranges.p.addr)
-        with m.Elif(self.dram.commands.ready):
+        with m.Elif(self.dram.commands.ready | r_do_skip):
             m.d.sync += r_length.eq(r_length + r_advance)
             m.d.sync += r_pointer.eq(r_pointer + r_advance)
             with m.If(r_pointer + r_advance == self._dram_range.stop):
@@ -354,7 +386,7 @@ class Reader(wiring.Component):
             self.dram.commands.p.type.eq(octoram.Command.ReadMemRow),
             self.dram.commands.p.addr.eq(r_pointer),
             self.dram.commands.p.size.eq(r_advance >> 1),
-            self.dram.commands.valid.eq(r_advance != 0),
+            self.dram.commands.valid.eq((r_advance != 0) | r_do_skip),
         ]
 
         # Maintain a count of entries (not bytes) committed to a burst that have not yet arrived
@@ -364,10 +396,12 @@ class Reader(wiring.Component):
             + (Mux(self.dram.commands.ready, r_advance // len(r_queue.i.payload), 0))
             - (r_queue.o.valid & r_queue.o.ready))
 
-        # Refill the buffer up to the next burst boundary (or until the end of the requested range).
+        # Refill the buffer up to the next burst boundary (or until the end of the requested range);
+        # or, skip to the next burst boundary. (To reduce resource usage, skipping reuses the same
+        # logic as reading, and is done on up to one burst boundary ahead per cycle.)
         free_queue_bytes = (r_queue.depth - r_pending) * len(r_queue.i.payload)
-        with m.If(r_active & (free_queue_bytes > self._burst_bytes)):
-            remainder_bytes  = self.i_ranges.p.size - r_length
+        with m.If((r_do_read & (free_queue_bytes > self._burst_bytes)) | r_do_skip):
+            remainder_bytes  = self.i_blocks.p.size - r_length
             next_burst_bytes = self._burst_bytes - (r_pointer & (self._burst_bytes - 1))
             with m.If(next_burst_bytes < remainder_bytes):
                 m.d.comb += r_advance.eq(next_burst_bytes)
@@ -376,16 +410,23 @@ class Reader(wiring.Component):
             with m.Else():
                 m.d.comb += r_advance.eq(self._burst_bytes)
 
-        with m.FSM():
+        m.d.comb += block_queue.i.payload.eq(self.i_blocks.payload)
+        with m.FSM(name="block_fsm"):
             with m.State("Idle"):
-                with m.If(self.i_ranges.valid):
-                    m.next = "Readout"
+                m.d.comb += block_queue.i.valid.eq(self.i_blocks.valid)
+                with m.If(self.i_blocks.valid & block_queue.i.ready):
+                    with m.If(self.i_blocks.p.skip):
+                        m.d.sync += r_do_skip.eq(1)
+                    with m.Else():
+                        m.d.sync += r_do_read.eq(1)
+                    m.next = "Busy"
 
-            with m.State("Readout"):
-                m.d.comb += r_active.eq(1)
-                with m.If(r_length + r_advance == self.i_ranges.p.size):
-                    with m.If(self.dram.commands.ready):
-                        m.d.comb += self.i_ranges.ready.eq(1)
+            with m.State("Busy"):
+                with m.If(r_length + r_advance == self.i_blocks.p.size):
+                    with m.If(self.dram.commands.ready | r_do_skip):
+                        m.d.comb += self.i_blocks.ready.eq(1)
+                        m.d.sync += r_do_read.eq(0)
+                        m.d.sync += r_do_skip.eq(0)
                         m.next = "Idle"
 
         return m
@@ -492,125 +533,16 @@ class FlowControl(wiring.Component):
         return m
 
 
-class ReadControl(wiring.Component):
-    """Readout control unit.
-
-    While the flow control unit caps the (conservative estimate of) size of the packed sample queue
-    to the DRAM region size, it does not function as a barrier: the fact that a credit has been
-    issued to write a byte enables the readout of one byte, but actually reading this byte may well
-    cause the reader to race ahead of the writer. This unit solves this problem.
-
-    Whenever the writer commits to writing a block, it outputs the extent of it (and trigger offset,
-    if any) via ``o_blocks``. At this point, the data in the block can be considered written (it may
-    still be in progress but not in a way where the reader can interrupt it and get ahead). Whenever
-    this happens, this unit expands the readout region by the block size (potentially capped to
-    the prolog size if it's still in a pre-trigger state).
-    """
-
-    CONTROL_SHAPE = data.StructLayout({
-        "prolog_size": 32, # 4-byte multiple
-        "epilog_size": 32, # 4-byte multiple
-        "streaming":   1,
-    })
-
-    control: In(CONTROL_SHAPE)
-
-    w_blocks: In(stream.Signature(data.StructLayout({
-        "addr": 32, # 4-byte aligned
-        "size": 8,  # 4-byte multiple
-        "trig": Packer.TRIG_SHAPE,
-    })))
-    r_ranges: Out(stream.Signature(data.StructLayout({
-        "addr": 32, # 4-byte aligned
-        "size": 32, # 4-byte multiple
-    })))
-
-    free_run: Out(1)
-
-    def __init__(self, *, dram_range: range):
-        assert dram_range.step == 1
-
-        self._dram_range = dram_range
-
-        super().__init__()
-
-    def elaborate(self, platform):
-        m = Module()
-
-        # See the comment in the `Prolog` state.
-        m.submodules.ranges = ranges = Queue(
-            shape=self.r_ranges.p.shape(), depth=1)
-        wiring.connect(m, ranges.o, flipped(self.r_ranges))
-
-        readout_addr = Signal(self._dram_range, init=self._dram_range.start)
-        readout_size = Signal(self._dram_range)
-        trigger_reg  = Signal.like(self.w_blocks.p.trig)
-
-        with m.FSM():
-            with m.State("Free-Run"):
-                m.d.comb += self.free_run.eq(1)
-                m.d.comb += self.w_blocks.ready.eq(1)
-                with m.If(self.w_blocks.valid):
-                    # Expand the readout region by the size of the just-committed block.
-                    next_size = readout_size + self.w_blocks.p.size
-                    with m.If(next_size <= self.control.prolog_size):
-                        m.d.sync += readout_size.eq(next_size)
-                    with m.Else():
-                        m.d.sync += readout_size.eq(self.control.prolog_size)
-                        next_addr = readout_addr + (next_size - self.control.prolog_size)
-                        with m.If(next_addr <= self._dram_range.stop):
-                            m.d.sync += readout_addr.eq(next_addr)
-                        with m.Else():
-                            m.d.sync += readout_addr.eq(next_addr - len(self._dram_range))
-
-                    m.d.sync += trigger_reg.eq(self.w_blocks.p.trig)
-                    with m.If(self.w_blocks.p.trig.active):
-                        m.next = "Prolog"
-
-            # This state should be only active for one cycle, since the lack of readiness blocks
-            # the writer's progress. The `ranges` buffer exists to make this happen.
-            with m.State("Prolog"):
-                m.d.comb += [
-                    ranges.i.p.addr.eq(readout_addr),
-                    ranges.i.p.size.eq(readout_size),
-                    ranges.i.valid.eq(readout_size > 0)
-                ]
-                with m.If(~ranges.i.valid | ranges.i.ready):
-                    m.d.sync += readout_addr.eq(readout_addr + readout_size)
-                    m.next = "Streaming"
-
-            with m.State("Streaming"):
-                # This comprises forbidden ready-to-valid feedback and only works because of
-                # the particular implementation of the `ranges` queue.
-                m.d.comb += [
-                    ranges.i.p.addr.eq(readout_addr),
-                    ranges.i.p.size.eq(self.w_blocks.p.size),
-                    ranges.i.valid.eq(self.w_blocks.valid),
-                    self.w_blocks.ready.eq(1),
-                ]
-                with m.If(ranges.i.valid & ranges.i.ready):
-                    next_addr = readout_addr + self.w_blocks.p.size
-                    with m.If(next_addr == self._dram_range.stop):
-                        m.d.sync += readout_addr.eq(self._dram_range.start)
-                    with m.Else():
-                        m.d.sync += readout_addr.eq(next_addr)
-                with m.Elif(ranges.i.valid):
-                    # TODO: combine ranges
-                    m.next = "Fault"
-
-            with m.State("Fault"):
-                pass
-
-        return m
-
-
 class AnalyzerCore(wiring.Component):
     dram: Out(octoram.Signature())
 
     divisor:  In(24)
     triggers: In(data.ArrayLayout(Trigger.Mode, 32))
     readout:  In(ReadControl.CONTROL_SHAPE)
-    samples:  Out(stream.Signature(8))
+    samples:  Out(stream.Signature(data.StructLayout({
+        "data": 8,
+        "end":  1,
+    })))
 
     def __init__(self, *, pins: io.PortLike, dram_range: range, burst_bytes: int):
         self._pins = pins
@@ -656,7 +588,7 @@ class AnalyzerCore(wiring.Component):
         m.submodules.read_ctrl = read_ctrl = ReadControl(dram_range=self._dram_range)
         m.d.comb += read_ctrl.control.eq(self.readout)
         wiring.connect(m, writer.o_blocks, read_ctrl.w_blocks)
-        wiring.connect(m, read_ctrl.r_ranges, reader.i_ranges)
+        wiring.connect(m, read_ctrl.r_blocks, reader.i_blocks)
 
         m.d.comb += [
             flow_ctrl.initial.eq(self.readout.prolog_size),
@@ -664,7 +596,6 @@ class AnalyzerCore(wiring.Component):
             trigger.active.eq(read_ctrl.free_run), # FIXME: race condition
         ]
 
-        # FIXME: needs to do some end handling
         wiring.connect(m, flow_ctrl.o_reader, flipped(self.samples))
 
         return m
@@ -680,6 +611,7 @@ class Command(enum.Enum, shape=8):
     GET_DATA_FORMAT     = 0b10_000110
     SET_TRIGGER         = 0b01_010000
     GET_TRIGGER         = 0b10_010000
+    SYNCHRONIZE         = 0b11_011111
 
     ARM_TRIGGER         = 0b00_000000
     FORCE_TRIGGER       = 0b00_000001
@@ -764,6 +696,9 @@ class CommandHandler(wiring.Component):
 
                 with m.Case(Command.SET_TRIGGER):
                     pass # Do nothing; we only support the basic trigger mode
+
+                with m.Case(Command.SYNCHRONIZE):
+                    m.d.comb += self.o.p.ret.eq(self.i.p.arg)
 
                 with m.Case(Command.ARM_TRIGGER):
                     m.d.sync += self.trigger_active.eq(1)
@@ -875,6 +810,9 @@ class OutputMultiplexer(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
+        # Used to ensure that data substreams are only interrupted at a word boundary.
+        data_index = Signal(range(4))
+
         with m.FSM():
             with m.State("Idle"):
                 with m.If(self.i_stream_cmd.valid):
@@ -890,6 +828,7 @@ class OutputMultiplexer(wiring.Component):
                         self.o_stream.valid.eq(1),
                     ]
                     with m.If(self.o_stream.valid & self.o_stream.ready):
+                        m.d.sync += data_index.eq(0)
                         m.next = "Data"
 
             with m.State("Command"):
@@ -903,13 +842,15 @@ class OutputMultiplexer(wiring.Component):
                 with m.If(self.i_stream_data.valid & self.i_stream_data.ready &
                           self.i_stream_data.p.end):
                     m.next = "Idle"
-                with m.Elif(self.i_stream_cmd.valid):
+                with m.Elif(self.i_stream_cmd.valid & (data_index == 0)):
                     m.next = "Data-Interrupt"
+                with m.Elif(self.i_stream_data.valid & self.i_stream_data.ready):
+                    m.d.sync += data_index.eq(data_index + 1)
 
             with m.State("Data-Interrupt"):
-                # Inject a "continuation" trailer.
                 m.d.comb += [
-                    self.o_stream.p.data.eq(0xFF),
+                    # Inject a "continuation" trailer.
+                    self.o_stream.p.data.eq(0x00),
                     self.o_stream.valid.eq(1),
                 ]
                 with m.If(self.o_stream.valid & self.o_stream.ready):
@@ -929,6 +870,7 @@ class OutputMultiplexer(wiring.Component):
 class AnalyzerComponent(wiring.Component):
     i_stream: In(stream.Signature(8))
     o_stream: Out(stream.Signature(8))
+    o_flush: Out(1)
 
     def __init__(self, ports):
         self._ports = ports
@@ -951,6 +893,7 @@ class AnalyzerComponent(wiring.Component):
         wiring.connect(m, cmd_parser.o_stream, output_mux.i_stream_cmd)
         wiring.connect(m, output_mux.o_stream, cobs_encoder.i)
         wiring.connect(m, cobs_encoder.o, flipped(self.o_stream))
+        m.d.comb += self.o_flush.eq(self.o_stream.payload == 0x00)
 
         return m
 
@@ -963,7 +906,8 @@ class AnalyzerInterface:
 
         ports = assembly.add_port_group(pins=pins)
         component = assembly.add_submodule(AnalyzerComponent(ports))
-        self._pipe = assembly.add_inout_pipe(component.o_stream, component.i_stream)
+        self._pipe = assembly.add_inout_pipe(
+            component.o_stream, component.i_stream, in_flush=component.o_flush)
 
     def _log(self, message: str, *args):
         self._logger.log(self._level, "analyzer: " + message, *args)

@@ -192,17 +192,27 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
         dram.memory[:] = bytes(range(64))
 
         async def testbench_ranges(ctx):
-            await stream_put(ctx, dut.i_ranges, {"addr": 0,  "size": 32})
-            await stream_put(ctx, dut.i_ranges, {"addr": 60, "size":  8})
+            await stream_put(ctx, dut.i_blocks, {"skip": 0, "size": 32,
+                                                 "trig": {"active": 1, "offset": 1}})
+            await stream_put(ctx, dut.i_blocks, {"skip": 1, "size": 28})
+            await stream_put(ctx, dut.i_blocks, {"skip": 0, "size":  8})
 
         async def testbench_octets(ctx):
             for index, expected in enumerate([
                 *range(0,  32),
+            ]):
+                assert (payload := await stream_get(ctx, dut.o_octets)) == {"data": expected}, \
+                    f"[{index}]: {payload['data']:02x} != {expected:02x}"
+
+            await stream_assert(ctx, dut.o_octets, {"data": 0x81})
+            await stream_assert(ctx, dut.o_octets, {"end":  1})
+
+            for index, expected in enumerate([
                 *range(60, 64),
                 *range(0,   4),
             ]):
-                assert (data := await stream_get(ctx, dut.o_octets)) == expected, \
-                    f"[{index}]: {data:02x} != {expected:02x}"
+                assert (payload := await stream_get(ctx, dut.o_octets)) == {"data": expected}, \
+                    f"[{index}]: {payload['data']:02x} != {expected:02x}"
 
         with self.run_test(m) as sim:
             sim.add_testbench(testbench_ranges, background=True)
