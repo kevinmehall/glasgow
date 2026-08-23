@@ -533,6 +533,111 @@ class FlowControl(wiring.Component):
         return m
 
 
+class ReadControl(wiring.Component):
+    """Readout control unit.
+
+    While the flow control unit caps the (conservative estimate of) size of the packed sample queue
+    to the DRAM region size, it does not function as a barrier: the fact that a credit has been
+    issued to write a byte enables the readout of one byte, but actually reading this byte may well
+    cause the reader to race ahead of the writer. This unit solves this problem.
+
+    Whenever the writer commits to writing a block, it outputs the extent of it (and trigger offset,
+    if any) via ``o_blocks``. At this point, the data in the block can be considered written (it may
+    still be in progress but not in a way where the reader can interrupt it and get ahead). Whenever
+    this happens, this unit expands the readout region by the block size (potentially capped to
+    the prolog size if it's still in a pre-trigger state).
+    """
+
+    CONTROL_SHAPE = data.StructLayout({
+        "prolog_size": 32, # 4-byte multiple
+        "epilog_size": 32, # 4-byte multiple
+        "streaming":   1,
+    })
+
+    control: In(CONTROL_SHAPE)
+
+    w_blocks: In(stream.Signature(data.StructLayout({
+        "size": 8, # 4-byte multiple
+        "trig": Packer.TRIG_SHAPE,
+    })))
+    r_blocks: Out(stream.Signature(data.StructLayout({
+        "skip": 1,
+        "size": 8, # 4-byte multiple
+    })))
+
+    free_run: Out(1)
+
+    def __init__(self, *, dram_range: range):
+        assert dram_range.step == 1
+
+        self._dram_range = dram_range
+
+        super().__init__()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        # See the comment in the `Prolog` state.
+        m.submodules.ranges = ranges = Queue(
+            shape=self.r_blocks.p.shape(), depth=1)
+        wiring.connect(m, ranges.o, flipped(self.r_blocks))
+
+        queue_len = Signal(self._dram_range)
+        m.d.sync += queue_len.eq(queue_len
+            + Mux(self.w_blocks.valid & self.w_blocks.ready, self.w_blocks.p.size, 0)
+            - Mux(self.r_blocks.valid & self.r_blocks.ready, self.r_blocks.p.size, 0))
+
+        trigger_reg  = Signal.like(self.w_blocks.p.trig)
+
+        with m.FSM():
+            with m.State("Free-Run"):
+                m.d.comb += self.free_run.eq(1)
+                with m.If(self.w_blocks.valid):
+                    remain = queue_len + self.w_blocks.p.size - self.control.prolog_size
+                    with m.If(remain <= 0):
+                        m.d.comb += [
+                            self.r_blocks.p.skip.eq(1),
+                            self.r_blocks.p.size.eq(remain),
+                            self.r_blocks.valid.eq(1),
+                        ]
+                        m.d.comb += self.w_blocks.ready.eq(self.r_blocks.ready)
+                    with m.Else():
+                        m.d.comb += self.w_blocks.ready.eq(1)
+
+                    m.d.sync += trigger_reg.eq(self.w_blocks.p.trig)
+                    with m.If(self.w_blocks.p.trig.active):
+                        m.next = "Prolog"
+
+            # This state should be only active for one cycle, since the lack of readiness blocks
+            # the writer's progress. The `ranges` buffer exists to make this happen.
+            with m.State("Prolog"):
+                m.d.comb += [
+                    ranges.i.p.size.eq(readout_size),
+                    ranges.i.valid.eq(readout_size > 0)
+                ]
+                with m.If(~ranges.i.valid | ranges.i.ready):
+                    m.next = "Streaming"
+
+            with m.State("Streaming"):
+                # This comprises forbidden ready-to-valid feedback and only works because of
+                # the particular implementation of the `ranges` queue.
+                m.d.comb += [
+                    ranges.i.p.size.eq(self.w_blocks.p.size),
+                    ranges.i.valid.eq(self.w_blocks.valid),
+                    self.w_blocks.ready.eq(1),
+                ]
+                with m.If(ranges.i.valid & ranges.i.ready):
+                    pass
+                with m.Elif(ranges.i.valid):
+                    # TODO: combine ranges
+                    m.next = "Fault"
+
+            with m.State("Fault"):
+                pass
+
+        return m
+
+
 class AnalyzerCore(wiring.Component):
     dram: Out(octoram.Signature())
 
