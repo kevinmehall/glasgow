@@ -41,6 +41,10 @@ xdebug = Signal(data.StructLayout({
     "credits":  32,
 }))
 
+tdebug = Signal(data.StructLayout({
+    "mode": data.ArrayLayout(3, 32),
+}))
+
 
 class Sampler(wiring.Component):
     """Sampler unit.
@@ -150,6 +154,8 @@ class Trigger(wiring.Component):
 
         with m.If(fsm.ongoing("Forced")):
             m.d.comb += self.o_samples.p.trig.eq(1)
+
+        m.d.comb += tdebug.mode.eq(self.control)
 
         return m
 
@@ -737,8 +743,8 @@ class AnalyzerCore(wiring.Component):
         m.d.comb += trigger.control.eq(self.trigger)
         wiring.connect(m, sampler.o_samples, trigger.i_samples)
 
-        # m.submodules.packer = packer = Packer(width=len(self._pins))
-        # wiring.connect(m, trigger.o_samples, packer.i_samples)
+        m.submodules.packer = packer = Packer(width=len(self._pins))
+        wiring.connect(m, trigger.o_samples, packer.i_samples)
 
         m.submodules.writer = writer = Writer(
             dram_range=self._dram_range, burst_bytes=self._burst_bytes)
@@ -756,13 +762,7 @@ class AnalyzerCore(wiring.Component):
             reader_ratio=1,
             max_credits=len(self._dram_range),
         )
-        # wiring.connect(m, packer.o_packed, flow_ctrl.i_writer)
-        m.d.comb += [
-            flow_ctrl.i_writer.p.data.eq(trigger.o_samples.p.data),
-            flow_ctrl.i_writer.p.trig.active.eq(trigger.o_samples.p.trig),
-            flow_ctrl.i_writer.valid.eq(trigger.o_samples.valid),
-            # trigger.o_samples.ready.eq(flow_ctrl.i_writer.ready),
-        ]
+        wiring.connect(m, packer.o_packed, flow_ctrl.i_writer)
         wiring.connect(m, flow_ctrl.o_writer, writer.i_packed)
         wiring.connect(m, reader.o_octets, flow_ctrl.i_reader)
 
@@ -1116,6 +1116,7 @@ class AnalyzerInterface:
         self._pipe = assembly.add_inout_pipe(
             component.o_stream, component.i_stream, in_flush=component.o_flush)
         self._xdebug = assembly.add_ro_register(xdebug)
+        self._tdebug = assembly.add_ro_register(tdebug)
 
     def _log(self, message: str, *args):
         self._logger.log(self._level, "analyzer: " + message, *args)
@@ -1161,13 +1162,17 @@ class AnalyzerApplet(GlasgowAppletV2):
     async def run(self, args):
         def pvalue(x):
             v = []
-            for mem, sh in x.shape().members.items():
-                v.append(f"{mem}={getattr(x,mem):{'#x' if Shape.cast(sh).width > 1 else ''}}")
+            for n, fld in x.shape():
+                if isinstance(fld.shape, data.Layout):
+                    v.append(f"{n}={pvalue(x[n])}")
+                else:
+                    v.append(f"{n}={x[n]:{'#x' if Shape.cast(fld.shape).width > 1 else ''}}")
             return ", ".join(v)
 
         async def poll_debug():
             while True:
                 print(pvalue(await self.analyzer_iface._xdebug.get()))
+                print(pvalue(await self.analyzer_iface._tdebug.get()))
                 await asyncio.sleep(1)
 
         a = asyncio.create_task(poll_debug())
