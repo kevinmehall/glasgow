@@ -72,7 +72,7 @@ class Sampler(wiring.Component):
         seq = Signal(range(256))
         with m.If(self.o_samples.valid):
             m.d.sync += seq.eq(seq + 1)
-            m.d.sync += self.o_samples.p.data.eq(seq == 128)
+            m.d.sync += self.o_samples.p.data.eq(Mux(seq == 128, 0x21, 0x20))
 
         timer = Signal.like(self.divisor)
         with m.If(timer == 0):
@@ -172,9 +172,11 @@ class Packer(wiring.Component):
     of bits, padding is added after each sample so that they start at power-of-2 bit indices.
     """
 
-    TRIG_SHAPE = data.StructLayout({
-        "active": 1,
-        "offset": range(32),
+    META_SHAPE = data.StructLayout({
+        "offset":   range(32),
+        "trigger":  1,
+        "overflow": 1,
+        "complete": 1,
     })
 
     i_samples: In(stream.Signature(data.StructLayout({
@@ -183,7 +185,7 @@ class Packer(wiring.Component):
     }), always_ready=True))
     o_packed: Out(stream.Signature(data.StructLayout({
         "data": data.ArrayLayout(8, 4),
-        "trig": TRIG_SHAPE,
+        "meta": META_SHAPE,
     }), always_ready=True))
 
     def __init__(self, *, width: int):
@@ -214,26 +216,26 @@ class Packer(wiring.Component):
 
         packs = self.samples_per_word
         count = Signal(range(packs))
-        trig  = Signal(self.TRIG_SHAPE)
+        meta  = Signal(self.META_SHAPE)
 
         for index in range(packs - 1):
             with m.If(self.i_samples.valid & (count == index)):
                 m.d.sync += self.o_packed.p.data.as_value().word_select(index, len(pack)).eq(pack)
-                with m.If(self.i_samples.p.trig & ~trig.active):
-                    m.d.sync += trig.active.eq(1)
-                    m.d.sync += trig.offset.eq(count * len(pack))
+                with m.If(self.i_samples.p.trig & ~meta.trigger):
+                    m.d.sync += meta.trigger.eq(1)
+                    m.d.sync += meta.offset.eq(count * len(pack))
 
         m.d.comb += self.o_packed.p.data.as_value().word_select(packs - 1, len(pack)).eq(pack)
-        with m.If(self.i_samples.p.trig & ~trig.active):
-            m.d.comb += self.o_packed.p.trig.active.eq(self.i_samples.p.trig)
-            m.d.comb += self.o_packed.p.trig.offset.eq((packs - 1) * len(pack))
+        with m.If(self.i_samples.p.trig & ~meta.trigger):
+            m.d.comb += self.o_packed.p.meta.trigger.eq(self.i_samples.p.trig)
+            m.d.comb += self.o_packed.p.meta.offset.eq((packs - 1) * len(pack))
         with m.Else():
-            m.d.comb += self.o_packed.p.trig.eq(trig)
+            m.d.comb += self.o_packed.p.meta.eq(meta)
 
         with m.If(self.i_samples.valid):
             m.d.sync += count.eq(count + 1)
             with m.If(count + 1 == packs):
-                m.d.sync += trig.eq(0)
+                m.d.sync += meta.eq(0)
                 m.d.comb += self.o_packed.valid.eq(1)
 
         return m
@@ -251,11 +253,11 @@ class Writer(wiring.Component):
 
     i_packed: In(stream.Signature(data.StructLayout({
         "data": data.ArrayLayout(8, 4),
-        "trig": Packer.TRIG_SHAPE,
+        "meta": Packer.META_SHAPE,
     })))
     o_blocks: Out(stream.Signature(data.StructLayout({
         "size": 8,  # 4-byte multiple
-        "trig": Packer.TRIG_SHAPE,
+        "meta": Packer.META_SHAPE,
     })))
 
     def __init__(self, *, dram_range: range, burst_bytes: int):
@@ -275,12 +277,12 @@ class Writer(wiring.Component):
         # the writer loses arbitration (it has priority, but reads are uninterruptible) and allows
         # filling the entire write queue.
         m.submodules.block_queue = block_queue = Queue(
-            shape=data.StructLayout({"addr": 32, "size": 8, "trig": Packer.TRIG_SHAPE}), depth=4)
+            shape=data.StructLayout({"addr": 32, "size": 8, "meta": Packer.META_SHAPE}), depth=4)
         block_ready = Signal()
         m.d.comb += [
             # Output the fact that block has been committed...
             self.o_blocks.p.size.eq(block_queue.o.p.size),
-            self.o_blocks.p.trig.eq(block_queue.o.p.trig),
+            self.o_blocks.p.meta.eq(block_queue.o.p.meta),
             self.o_blocks.valid.eq(block_queue.o.valid & block_ready),
             block_queue.o.ready.eq(self.o_blocks.ready & block_ready),
             # ... and write the block itself...
@@ -324,7 +326,7 @@ class Writer(wiring.Component):
         m.d.comb += [
             block_queue.i.p.addr.eq(w_pointer),
             block_queue.i.p.size.eq(w_advance),
-            block_queue.i.p.trig.eq(self.i_packed.p.trig),
+            block_queue.i.p.meta.eq(self.i_packed.p.meta),
             block_queue.i.valid.eq(w_advance != 0),
         ]
 
@@ -343,8 +345,10 @@ class Writer(wiring.Component):
         # Sometimes the buffer will be drained without it being strictly required, but that's OK.
         # Also drain on explicit flush.
         next_level_bytes = (w_pending + 1) * len(w_queue.i.payload)
+        flush_block = (self.i_packed.p.meta.trigger | self.i_packed.p.meta.overflow |
+                       self.i_packed.p.meta.complete)
         with m.If((((w_pointer + next_level_bytes) & (self._burst_bytes - 1)) == 0) |
-                  self.i_packed.p.trig.active):
+                  flush_block):
             with m.If(w_queue.i.valid & w_queue.i.ready & block_queue.i.ready):
                 m.d.comb += w_advance.eq(next_level_bytes)
 
@@ -366,7 +370,7 @@ class Reader(wiring.Component):
     i_blocks: In(stream.Signature(data.StructLayout({
         "skip": 1, # whether to read range contents or only advance the pointer
         "size": 8, # 4-byte multiple
-        "trig": Packer.TRIG_SHAPE,
+        "meta": Packer.META_SHAPE,
     })))
     o_octets: Out(stream.Signature(data.StructLayout({
         "data": 8,
@@ -411,14 +415,21 @@ class Reader(wiring.Component):
                     m.d.sync += r_count.eq(r_count + 1)
                     with m.If(r_count + 1 == block_queue.o.p.size):
                         m.d.sync += r_count.eq(0)
-                        with m.If(~block_queue.o.p.trig.active):
-                            m.d.comb += block_queue.o.ready.eq(1)
-                        with m.Else():
+                        with m.If(block_queue.o.p.meta.trigger |
+                                  block_queue.o.p.meta.overflow |
+                                  block_queue.o.p.meta.complete):
                             m.next = "Trailer"
+                        with m.Else():
+                            m.d.comb += block_queue.o.ready.eq(1)
 
             # Append a trailer and end the stream.
             with m.State("Trailer"):
-                m.d.comb += self.o_octets.p.data.eq(0x80 | block_queue.o.p.trig.offset)
+                with m.If(block_queue.o.p.meta.trigger):
+                    m.d.comb += self.o_octets.p.data.eq(0x80 | block_queue.o.p.meta.offset)
+                with m.Elif(block_queue.o.p.meta.overflow):
+                    m.d.comb += self.o_octets.p.data.eq(0x40 | block_queue.o.p.meta.offset)
+                with m.Elif(block_queue.o.p.meta.complete):
+                    m.d.comb += self.o_octets.p.data.eq(0xC0 | block_queue.o.p.meta.offset)
                 m.d.comb += self.o_octets.valid.eq(1)
                 with m.If(self.o_octets.valid & self.o_octets.ready):
                     m.d.comb += block_queue.o.ready.eq(1)
@@ -626,22 +637,23 @@ class Readout(wiring.Component):
 
     w_blocks: In(stream.Signature(data.StructLayout({
         "size": 8, # 4-byte multiple
-        "trig": Packer.TRIG_SHAPE,
+        "meta": Packer.META_SHAPE,
     })))
     r_blocks: Out(stream.Signature(data.StructLayout({
         "skip": 1, # whether to read range contents or only advance the pointer
         "size": 8, # 4-byte multiple
-        "trig": Packer.TRIG_SHAPE,
+        "meta": Packer.META_SHAPE,
     })))
 
     free_run: Out(1)
 
-    def __init__(self, *, dram_range: range, burst_bytes: int):
+    def __init__(self, *, dram_range: range, burst_bytes: int, sample_stride: int):
         assert dram_range.step == 1
         assert burst_bytes % 4 == 0
 
-        self._dram_range  = dram_range
-        self._burst_bytes = burst_bytes>>2
+        self._dram_range    = dram_range
+        self._burst_bytes   = burst_bytes
+        self._sample_stride = sample_stride
 
         super().__init__()
 
@@ -650,7 +662,7 @@ class Readout(wiring.Component):
 
         queue_size = Signal(range(len(self._dram_range)))
         read_count = Signal(range(len(self._dram_range)))
-        saved_trig = Signal.like(self.w_blocks.p.trig)
+        saved_meta = Signal.like(self.w_blocks.p.meta)
 
         m.d.sync += queue_size.eq(queue_size
             + Mux(self.w_blocks.valid & self.w_blocks.ready, self.w_blocks.p.size, 0)
@@ -661,7 +673,7 @@ class Readout(wiring.Component):
                 m.d.comb += self.free_run.eq(1)
                 m.d.comb += self.w_blocks.ready.eq(1)
                 with m.If(self.w_blocks.valid):
-                    m.d.sync += saved_trig.eq(self.w_blocks.p.trig)
+                    m.d.sync += saved_meta.eq(self.w_blocks.p.meta)
                     m.next = "Pre-Trigger/Skip"
 
             with m.State("Pre-Trigger/Skip"):
@@ -675,7 +687,7 @@ class Readout(wiring.Component):
                         self.r_blocks.valid.eq(1),
                     ]
                     with m.If(self.r_blocks.valid & self.r_blocks.ready):
-                        with m.If(saved_trig.active):
+                        with m.If(saved_meta.trigger | saved_meta.overflow | saved_meta.complete):
                             m.next = "Fencepost"
                         with m.Else():
                             m.next = "Pre-Trigger/Write"
@@ -693,7 +705,7 @@ class Readout(wiring.Component):
                         m.d.sync += read_count.eq(read_count - self._burst_bytes)
                 with m.Else():
                     m.d.comb += self.r_blocks.p.size.eq(read_count)
-                    m.d.comb += self.r_blocks.p.trig.eq(saved_trig)
+                    m.d.comb += self.r_blocks.p.meta.eq(saved_meta)
                     with m.If(self.r_blocks.valid & self.r_blocks.ready):
                         m.d.sync += read_count.eq(self.control.epilog_size)
                         m.next = "Read-Epilog"
@@ -707,7 +719,8 @@ class Readout(wiring.Component):
                         m.d.sync += read_count.eq(read_count - self._burst_bytes)
                 with m.Else():
                     m.d.comb += self.r_blocks.p.size.eq(read_count)
-                    # TODO: insert end marker when this is implemented
+                    m.d.comb += self.r_blocks.p.meta.complete.eq(1)
+                    m.d.comb += self.r_blocks.p.meta.offset.eq(32 - self._sample_stride)
                     with m.If(self.r_blocks.valid & self.r_blocks.ready):
                         m.next = "Pre-Trigger/Write"
 
@@ -767,7 +780,8 @@ class AnalyzerCore(wiring.Component):
         wiring.connect(m, reader.o_octets, flow_ctrl.i_reader)
 
         m.submodules.readout = readout = Readout(
-            dram_range=self._dram_range, burst_bytes=self._burst_bytes)
+            dram_range=self._dram_range, burst_bytes=self._burst_bytes,
+            sample_stride=packer.stride)
         m.d.comb += readout.control.eq(self.readout)
         wiring.connect(m, writer.o_blocks, readout.w_blocks)
         wiring.connect(m, readout.r_blocks, reader.i_blocks)
@@ -1030,7 +1044,8 @@ class OutputMultiplexer(wiring.Component):
                         m.d.sync += data_index.eq(data_index + 1)
                         with m.If(self.i_stream_cmd.valid & (data_index == 3)):
                             m.next = "Data-Interrupt"
-                with m.Elif(data_index == 0):
+                with m.Elif(self.i_stream_cmd.valid & (data_index == 0)):
+                # with m.Elif(data_index == 0):
                     m.next = "Data-Interrupt"
 
             with m.State("Data-Interrupt"):

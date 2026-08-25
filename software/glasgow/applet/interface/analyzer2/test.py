@@ -43,38 +43,61 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
                 sim.add_testbench(testbench_pins, background=True)
                 sim.add_testbench(testbench_samples)
 
-    def test_trigger(self):
+    def test_trigger_level(self):
         dut = Trigger()
 
         async def testbench_samples(ctx):
             for value in range(0, 64):
                 await stream_put(ctx, dut.i_samples, {"data": value})
 
-        for name, trigger_modes, trigger_actives in (
-            # data[1] -> level(1)
-            ("level", [
-                (1, Trigger.Mode.const({"active": 1, "value": 1, "level": 1})),
-            ], [
-                0, 0, 1, 1, 0, 0,
-            ]),
-            # data[1] -> posedge(1)
-            ("posedge", [
-                (1, Trigger.Mode.const({"active": 1, "value": 1, "level": 0})),
-            ], [
-                0, 0, 1, 0, 0, 0,
-            ]),
-        ):
-            async def testbench_triggers(ctx):
-                ctx.set(dut.active, 1)
-                for index, mode in trigger_modes:
-                    ctx.set(dut.mode[index], mode)
-                for value, active in zip(range(0, 64), trigger_actives):
-                    await stream_assert(ctx, dut.o_samples, {"data": value, "trig": active})
+        async def testbench_triggers(ctx):
+            ctx.set(dut.control.mode[1], {"active": 1, "value": 1, "level": 1})
+            for value in range(0, 64):
+                ctx.set(dut.control.enable,
+                    value == 0 or value == 6)
+                await stream_assert(ctx, dut.o_samples, {"data": value, "trig":
+                    value == 2 or value == 7})
 
-            with self.subTest(name=name):
-                with self.run_test(dut) as sim:
-                    sim.add_testbench(testbench_samples, background=True)
-                    sim.add_testbench(testbench_triggers)
+        with self.run_test(dut) as sim:
+            sim.add_testbench(testbench_samples, background=True)
+            sim.add_testbench(testbench_triggers)
+
+    def test_trigger_edge(self):
+        dut = Trigger()
+
+        async def testbench_samples(ctx):
+            for value in range(0, 64):
+                await stream_put(ctx, dut.i_samples, {"data": value})
+
+        async def testbench_triggers(ctx):
+            ctx.set(dut.control.mode[1], {"active": 1, "value": 1, "level": 0})
+            for value in range(0, 64):
+                ctx.set(dut.control.enable,
+                    value == 0 or value == 6)
+                await stream_assert(ctx, dut.o_samples, {"data": value, "trig":
+                    value == 2 or value == 10})
+
+        with self.run_test(dut) as sim:
+            sim.add_testbench(testbench_samples, background=True)
+            sim.add_testbench(testbench_triggers)
+
+    def test_trigger_force(self):
+        dut = Trigger()
+
+        async def testbench_samples(ctx):
+            for value in range(0, 64):
+                await stream_put(ctx, dut.i_samples, {"data": value})
+
+        async def testbench_triggers(ctx):
+            for value in range(0, 64):
+                ctx.set(dut.control.force,
+                    value == 6)
+                await stream_assert(ctx, dut.o_samples, {"data": value, "trig":
+                    value == 7})
+
+        with self.run_test(dut) as sim:
+            sim.add_testbench(testbench_samples, background=True)
+            sim.add_testbench(testbench_triggers)
 
     def test_packer_samples_per_word(self):
         def check_width(width, per_word):
@@ -96,20 +119,20 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
     def test_packer_format(self):
         for width, offset, results in [
             (32, 2, [
-                {"data": [0x00,0x00,0x00,0x00], "trig": {"active": 0}},
-                {"data": [0x01,0x00,0x00,0x00], "trig": {"active": 0}},
-                {"data": [0x02,0x00,0x00,0x00], "trig": {"active": 1, "offset": 0}},
+                {"data": [0x00,0x00,0x00,0x00], "meta": {"trigger": 0}},
+                {"data": [0x01,0x00,0x00,0x00], "meta": {"trigger": 0}},
+                {"data": [0x02,0x00,0x00,0x00], "meta": {"trigger": 1, "offset": 0}},
             ]),
             (1, 5, [
-                {"data": [0xAA,0xAA,0xAA,0xAA], "trig": {"active": 1, "offset": 5}},
+                {"data": [0xAA,0xAA,0xAA,0xAA], "meta": {"trigger": 1, "offset": 5}},
             ]),
             (1, 32, [
-                {"data": [0xAA,0xAA,0xAA,0xAA], "trig": {"active": 0}},
-                {"data": [0xAA,0xAA,0xAA,0xAA], "trig": {"active": 1, "offset": 0}},
+                {"data": [0xAA,0xAA,0xAA,0xAA], "meta": {"trigger": 0}},
+                {"data": [0xAA,0xAA,0xAA,0xAA], "meta": {"trigger": 1, "offset": 0}},
             ]),
             (4, 3, [
-                {"data": [0x10,0x32,0x54,0x76], "trig": {"active": 1, "offset": 12}},
-                {"data": [0x98,0xBA,0xDC,0xFE], "trig": {"active": 0}},
+                {"data": [0x10,0x32,0x54,0x76], "meta": {"trigger": 1, "offset": 12}},
+                {"data": [0x98,0xBA,0xDC,0xFE], "meta": {"trigger": 0}},
             ]),
         ]:
             dut = Packer(width=width)
@@ -136,26 +159,30 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
 
         async def testbench_packed(ctx):
             for packed in [
-                {"data": [0x10,0x32,0x54,0x76], "trig": {"active": 0}},
-                {"data": [0x98,0xBA,0xDC,0xFE], "trig": {"active": 0}},
-                {"data": [0x00,0x11,0x22,0x33], "trig": {"active": 0}},
-                {"data": [0x44,0x55,0x66,0x77], "trig": {"active": 0}},
+                {"data": [0x10,0x32,0x54,0x76], "meta": {}},
+                {"data": [0x98,0xBA,0xDC,0xFE], "meta": {}},
+                {"data": [0x00,0x11,0x22,0x33], "meta": {}},
+                {"data": [0x44,0x55,0x66,0x77], "meta": {}},
 
-                {"data": [0x00,0x00,0x11,0x11], "trig": {"active": 0}},
-                {"data": [0x22,0x22,0x33,0x33], "trig": {"active": 0}},
-                {"data": [0x44,0x44,0x55,0x55], "trig": {"active": 0}},
-                {"data": [0x66,0x66,0x77,0x77], "trig": {"active": 0}},
+                {"data": [0x00,0x00,0x11,0x11], "meta": {}},
+                {"data": [0x22,0x22,0x33,0x33], "meta": {}},
+                {"data": [0x44,0x44,0x55,0x55], "meta": {}},
+                {"data": [0x66,0x66,0x77,0x77], "meta": {}},
 
-                {"data": [0xA0,0xA1,0xA2,0xA3], "trig": {"active": 0}},
-                {"data": [0xB0,0xB1,0xB2,0xB3], "trig": {"active": 1, "offset": 16}},
+                {"data": [0xA0,0xA1,0xA2,0xA3], "meta": {}},
+                {"data": [0xB0,0xB1,0xB2,0xB3], "meta": {"trigger": 1, "offset": 16}},
 
-                {"data": [0x00,0x00,0x11,0x11], "trig": {"active": 0}},
-                {"data": [0x22,0x22,0x33,0x33], "trig": {"active": 0}},
-                {"data": [0x44,0x44,0x55,0x55], "trig": {"active": 0}},
-                {"data": [0x66,0x66,0x77,0x77], "trig": {"active": 0}},
+                {"data": [0x00,0x00,0x11,0x11], "meta": {}},
+                {"data": [0x22,0x22,0x33,0x33], "meta": {}},
+                {"data": [0x44,0x44,0x55,0x55], "meta": {}},
+                {"data": [0x66,0x66,0x77,0x77], "meta": {}},
 
-                {"data": [0x00,0x00,0x11,0x11], "trig": {"active": 0}},
-                {"data": [0xE0,0xE1,0xE2,0xE3], "trig": {"active": 0}},
+                {"data": [0x00,0x00,0x11,0x11], "meta": {}},
+                {"data": [0xE0,0xE1,0xE2,0xE3], "meta": {}},
+
+                {"data": [0xF0,0xF1,0xF2,0xF3], "meta": {"overflow": 1}},
+
+                {"data": [0xD0,0xD1,0xD2,0xD3], "meta": {"complete": 1}},
             ]:
                 await stream_put(ctx, dut.i_packed, packed)
 
@@ -163,20 +190,30 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
             await ctx.tick().repeat(32)
             assert dram.memory[0:4] == b"\x00\x00\x00\x00", dram.memory.hex()
             await stream_assert(ctx, dut.o_blocks,
-                {"size": 32, "trig": {"active": 0}})
+                {"size": 32, "meta": {}})
 
             await ctx.tick().repeat(32)
             assert dram.memory[0:4] == b"\x10\x32\x54\x76", dram.memory.hex()
             await stream_assert(ctx, dut.o_blocks,
-                {"size":  8, "trig": {"active": 1, "offset": 16}})
+                {"size":  8, "meta": {"trigger": 1, "offset": 16}})
 
             await ctx.tick().repeat(32)
             assert dram.memory[32:36] == b"\xA0\xA1\xA2\xA3", dram.memory.hex()
 
             await stream_assert(ctx, dut.o_blocks,
-                {"size": 24, "trig": {"active": 0}})
+                {"size": 24, "meta": {}})
             await ctx.tick().repeat(32)
             assert dram.memory[60:64] == b"\xE0\xE1\xE2\xE3", dram.memory.hex()
+
+            await stream_assert(ctx, dut.o_blocks,
+                {"size": 4, "meta": {"overflow": 1}})
+            await ctx.tick().repeat(32)
+            assert dram.memory[0:4] == b"\xF0\xF1\xF2\xF3", dram.memory.hex()
+
+            await stream_assert(ctx, dut.o_blocks,
+                {"size": 4, "meta": {"complete": 1}})
+            await ctx.tick().repeat(32)
+            assert dram.memory[4:8] == b"\xD0\xD1\xD2\xD3", dram.memory.hex()
 
         with self.run_test(m) as sim:
             sim.add_testbench(testbench_packed)
@@ -193,9 +230,10 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
 
         async def testbench_ranges(ctx):
             await stream_put(ctx, dut.i_blocks, {"skip": 0, "size": 32,
-                                                 "trig": {"active": 1, "offset": 1}})
+                                                 "meta": {"trigger": 1, "offset": 1}})
             await stream_put(ctx, dut.i_blocks, {"skip": 1, "size": 28})
-            await stream_put(ctx, dut.i_blocks, {"skip": 0, "size":  8})
+            await stream_put(ctx, dut.i_blocks, {"skip": 0, "size":  8,
+                                                 "meta": {"complete": 1, "offset": 8}})
 
         async def testbench_octets(ctx):
             for index, expected in enumerate([
@@ -213,6 +251,9 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
             ]):
                 assert (payload := await stream_get(ctx, dut.o_octets)) == {"data": expected}, \
                     f"[{index}]: {payload['data']:02x} != {expected:02x}"
+
+            await stream_assert(ctx, dut.o_octets, {"data": 0xC8})
+            await stream_assert(ctx, dut.o_octets, {"end":  1})
 
         with self.run_test(m) as sim:
             sim.add_testbench(testbench_ranges, background=True)
@@ -304,9 +345,10 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
             for expected in [
                 {"data": 0x1A}, {"data": 0x1B}, {"data": 0x1C}, {"data": 0x1D},
                 {"data": 0x1E}, {"data": 0x1F}, {"data": 0x20}, {"data": 0x21},
-                {"data": 0x90}, {"end": 1},
+                {"data": 0x80|16}, {"end": 1},
                 {"data": 0x22}, {"data": 0x23}, {"data": 0x24}, {"data": 0x25},
                 {"data": 0x26}, {"data": 0x27}, {"data": 0x28}, {"data": 0x29},
+                {"data": 0xC0|24}, {"end": 1},
             ]:
                 await stream_assert(ctx, dut.samples, expected)
 
