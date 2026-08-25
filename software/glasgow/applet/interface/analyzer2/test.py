@@ -163,18 +163,18 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
             await ctx.tick().repeat(32)
             assert dram.memory[0:4] == b"\x00\x00\x00\x00", dram.memory.hex()
             await stream_assert(ctx, dut.o_blocks,
-                {"addr": 0x0000, "size": 32, "trig": {"active": 0}})
+                {"size": 32, "trig": {"active": 0}})
 
             await ctx.tick().repeat(32)
             assert dram.memory[0:4] == b"\x10\x32\x54\x76", dram.memory.hex()
             await stream_assert(ctx, dut.o_blocks,
-                {"addr": 0x0020, "size":  8, "trig": {"active": 1, "offset": 16}})
+                {"size":  8, "trig": {"active": 1, "offset": 16}})
 
             await ctx.tick().repeat(32)
             assert dram.memory[32:36] == b"\xA0\xA1\xA2\xA3", dram.memory.hex()
 
             await stream_assert(ctx, dut.o_blocks,
-                {"addr": 0x0028, "size": 24, "trig": {"active": 0}})
+                {"size": 24, "trig": {"active": 0}})
             await ctx.tick().repeat(32)
             assert dram.memory[60:64] == b"\xE0\xE1\xE2\xE3", dram.memory.hex()
 
@@ -284,24 +284,31 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
         async def testbench_ctrl(ctx):
             ctx.set(dut.divisor, 1)
 
-            # pins==0x40
-            ctx.set(dut.triggers[5], {"active": 1, "value": 1, "level": 0})
-
             ctx.set(dut.readout.prolog_size, 8)
             ctx.set(dut.readout.epilog_size, 8)
 
+            # pins==0x40
+            ctx.set(dut.trigger.mode[5], {"active": 1, "value": 1, "level": 0})
+
+            ctx.set(dut.trigger.enable, 1)
+            await ctx.tick()
+            ctx.set(dut.trigger.enable, 0)
+
         async def testbench_i(ctx):
-            for value in range(0x100):
+            for value in range(0x80):
                 await ctx.tick()
                 await ctx.tick()
                 ctx.set(pins.i, value&0xff)
 
         async def testbench_o(ctx):
-            # for expected in range(0x1a, 0x1a+8+8+1):
-            #     assert (actual := await stream_get(ctx, dut.samples)), \
-            #         f"{actual:02x} != {expected:02x}"
-            for _ in range(0x100):
-                await stream_get(ctx, dut.samples)
+            for expected in [
+                {"data": 0x1A}, {"data": 0x1B}, {"data": 0x1C}, {"data": 0x1D},
+                {"data": 0x1E}, {"data": 0x1F}, {"data": 0x20}, {"data": 0x21},
+                {"data": 0x90}, {"end": 1},
+                {"data": 0x22}, {"data": 0x23}, {"data": 0x24}, {"data": 0x25},
+                {"data": 0x26}, {"data": 0x27}, {"data": 0x28}, {"data": 0x29},
+            ]:
+                await stream_assert(ctx, dut.samples, expected)
 
         with self.run_test(m) as sim:
             sim.add_testbench(testbench_ctrl)
