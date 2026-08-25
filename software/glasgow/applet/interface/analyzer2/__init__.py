@@ -10,6 +10,8 @@
 # because the analyzer is designed for interfacing with external software, some of which may be
 # written in a way that makes complex and generic bitwise transformations unreasonably difficult.
 
+import asyncio
+
 from amaranth import *
 from amaranth.utils import ceil_log2
 from amaranth.lib import enum, data, wiring, stream, io
@@ -24,6 +26,20 @@ from glasgow.applet import GlasgowAppletV2
 
 
 __all__ = ["AnalyzerCore", "AnalyzerComponent"]
+
+
+xdebug = Signal(data.StructLayout({
+    "r_addr": 32,
+    "r_pend": 16,
+    "r_levl": 16,
+    "w_addr": 32,
+    "w_pend": 16,
+    "w_levl": 16,
+    "overflow": 1,
+    "free_run": 1,
+    "arb_mode": 1,
+    "credits":  32,
+}))
 
 
 class Sampler(wiring.Component):
@@ -49,9 +65,13 @@ class Sampler(wiring.Component):
         m.submodules.i_buf = i_buf = io.FFBuffer("i", self._pins)
         # m.d.comb += self.o_samples.p.data.eq(i_buf.i)
 
+        seq = Signal(range(256))
+        with m.If(self.o_samples.valid):
+            m.d.sync += seq.eq(seq + 1)
+            m.d.sync += self.o_samples.p.data.eq(seq == 128)
+
         timer = Signal.like(self.divisor)
         with m.If(timer == 0):
-            m.d.sync += self.o_samples.p.data.eq(self.o_samples.p.data) # XXX
             m.d.comb += self.o_samples.valid.eq(1)
             m.d.sync += timer.eq(self.divisor)
         with m.Else():
@@ -99,7 +119,7 @@ class Trigger(wiring.Component):
             self.o_samples.valid.eq(self.i_samples.valid),
         ]
 
-        with m.FSM(init="Forced") as fsm:
+        with m.FSM() as fsm:
             with m.State("Disabled"):
                 with m.If(self.control.enable):
                     m.next = "Enabled"
@@ -130,10 +150,6 @@ class Trigger(wiring.Component):
 
         with m.If(fsm.ongoing("Forced")):
             m.d.comb += self.o_samples.p.trig.eq(1)
-
-        led = platform.request("led", 0).o
-        with m.If(self.o_samples.p.trig):
-            m.d.sync += led.eq(1)
 
         return m
 
@@ -277,8 +293,8 @@ class Writer(wiring.Component):
             shape=data.ArrayLayout(8, 4), depth=(self._burst_bytes >> 2) * 4)
         m.d.comb += [
             w_queue.i.payload.eq(Cat(self.i_packed.p.data)),
-            w_queue.i.valid.eq(self.i_packed.valid),
-            self.i_packed.ready.eq(w_queue.i.ready),
+            w_queue.i.valid.eq(self.i_packed.valid & block_queue.i.ready),
+            self.i_packed.ready.eq(w_queue.i.ready & block_queue.i.ready),
         ]
 
         # Convert 4-byte packed samples into 2-byte memory beats.
@@ -325,6 +341,10 @@ class Writer(wiring.Component):
                   self.i_packed.p.trig.active):
             with m.If(w_queue.i.valid & w_queue.i.ready & block_queue.i.ready):
                 m.d.comb += w_advance.eq(next_level_bytes)
+
+        m.d.sync += xdebug.w_addr.eq(w_pointer)
+        m.d.sync += xdebug.w_pend.eq(w_pending)
+        m.d.sync += xdebug.w_levl.eq(w_queue.level)
 
         return m
 
@@ -421,7 +441,7 @@ class Reader(wiring.Component):
             self.dram.commands.p.type.eq(octoram.Command.ReadMemRow),
             self.dram.commands.p.addr.eq(r_pointer),
             self.dram.commands.p.size.eq(r_advance >> 1),
-            self.dram.commands.valid.eq((r_advance != 0) | r_do_skip),
+            self.dram.commands.valid.eq((r_advance != 0) & ~r_do_skip),
         ]
 
         # Maintain a count of entries (not bytes) committed to a burst that have not yet arrived
@@ -457,14 +477,16 @@ class Reader(wiring.Component):
                     m.next = "Busy"
 
             with m.State("Busy"):
-                with m.If(self.dram.commands.ready):
-                    m.d.sync += platform.request("led", 2).o.eq(1)
                 with m.If(r_length + r_advance == self.i_blocks.p.size):
                     with m.If(self.dram.commands.ready | r_do_skip):
                         m.d.comb += self.i_blocks.ready.eq(1)
                         m.d.sync += r_do_read.eq(0)
                         m.d.sync += r_do_skip.eq(0)
                         m.next = "Idle"
+
+        m.d.sync += xdebug.r_addr.eq(r_pointer)
+        m.d.sync += xdebug.r_pend.eq(r_pending)
+        m.d.sync += xdebug.r_levl.eq(r_queue.level)
 
         return m
 
@@ -492,11 +514,13 @@ class Arbiter(wiring.Component):
                 wiring.connect(m, flipped(self.writer.commands), flipped(self.dram.commands))
                 with m.If(~self.writer.commands.valid & self.reader.commands.valid):
                     m.next = "Reader"
+                m.d.sync += xdebug.arb_mode.eq(0)
 
             with m.State("Reader"):
                 wiring.connect(m, flipped(self.reader.commands), flipped(self.dram.commands))
                 with m.If(~self.reader.commands.valid):
                     m.next = "Writer"
+                m.d.sync += xdebug.arb_mode.eq(1)
 
         return m
 
@@ -558,12 +582,15 @@ class FlowControl(wiring.Component):
             with m.Else():
                 with m.If(credits <= self._max_credits - self._writer_ratio):
                     m.d.comb += do_writes.eq(self.o_writer.ready)
-                m.d.sync += credits.eq(credits2)
+                with m.If(credits2 > 0): # XXX
+                    m.d.sync += credits.eq(credits2)
 
         with m.If(self.i_writer.valid & ~self.o_writer.valid):
             m.d.sync += self.overflow.eq(1)
 
-        m.d.comb += platform.request("led", 1).o.eq(self.overflow)
+        m.d.sync += xdebug.overflow.eq(self.overflow)
+        m.d.sync += xdebug.free_run.eq(self.free_run)
+        m.d.sync += xdebug.credits.eq(credits)
 
         return m
 
@@ -608,7 +635,7 @@ class Readout(wiring.Component):
         assert burst_bytes % 4 == 0
 
         self._dram_range  = dram_range
-        self._burst_bytes = burst_bytes
+        self._burst_bytes = burst_bytes>>2
 
         super().__init__()
 
@@ -710,8 +737,8 @@ class AnalyzerCore(wiring.Component):
         m.d.comb += trigger.control.eq(self.trigger)
         wiring.connect(m, sampler.o_samples, trigger.i_samples)
 
-        m.submodules.packer = packer = Packer(width=len(self._pins))
-        wiring.connect(m, packer.i_samples, trigger.o_samples)
+        # m.submodules.packer = packer = Packer(width=len(self._pins))
+        # wiring.connect(m, trigger.o_samples, packer.i_samples)
 
         m.submodules.writer = writer = Writer(
             dram_range=self._dram_range, burst_bytes=self._burst_bytes)
@@ -729,7 +756,13 @@ class AnalyzerCore(wiring.Component):
             reader_ratio=1,
             max_credits=len(self._dram_range),
         )
-        wiring.connect(m, packer.o_packed, flow_ctrl.i_writer)
+        # wiring.connect(m, packer.o_packed, flow_ctrl.i_writer)
+        m.d.comb += [
+            flow_ctrl.i_writer.p.data.eq(trigger.o_samples.p.data),
+            flow_ctrl.i_writer.p.trig.active.eq(trigger.o_samples.p.trig),
+            flow_ctrl.i_writer.valid.eq(trigger.o_samples.valid),
+            # trigger.o_samples.ready.eq(flow_ctrl.i_writer.ready),
+        ]
         wiring.connect(m, flow_ctrl.o_writer, writer.i_packed)
         wiring.connect(m, reader.o_octets, flow_ctrl.i_reader)
 
@@ -833,11 +866,11 @@ class CommandHandler(wiring.Component):
                     m.d.sync += self.cfg_update.eq(1)
 
                 with m.Case(Command.SET_PROLOG_SIZE):
-                    m.d.sync += self.readout.prolog_size.eq(self.i.p.arg)
+                    m.d.sync += self.readout.prolog_size.eq(self.i.p.arg << 2)
                     m.d.sync += self.cfg_update.eq(1)
 
                 with m.Case(Command.SET_EPILOG_SIZE):
-                    m.d.sync += self.readout.epilog_size.eq(self.i.p.arg[:31])
+                    m.d.sync += self.readout.epilog_size.eq(self.i.p.arg[:31] << 2)
                     m.d.sync += self.readout.streaming.eq(self.i.p.arg[31])
                     m.d.sync += self.cfg_update.eq(1)
 
@@ -990,13 +1023,14 @@ class OutputMultiplexer(wiring.Component):
 
             with m.State("Data"):
                 wiring.connect(m, flipped(self.i_stream_data), flipped(self.o_stream))
-                with m.If(self.i_stream_data.valid & self.i_stream_data.ready &
-                          ~self.i_stream_data.p.end):
-                    m.d.sync += data_index.eq(data_index + 1)
-                with m.If(self.i_stream_data.valid & self.i_stream_data.ready &
-                          self.i_stream_data.p.end):
-                    m.next = "Idle"
-                with m.Elif(self.i_stream_cmd.valid & (data_index == 3)):
+                with m.If(self.i_stream_data.valid & self.i_stream_data.ready):
+                    with m.If(self.i_stream_data.p.end):
+                        m.next = "Idle"
+                    with m.Else():
+                        m.d.sync += data_index.eq(data_index + 1)
+                        with m.If(self.i_stream_cmd.valid & (data_index == 3)):
+                            m.next = "Data-Interrupt"
+                with m.Elif(data_index == 0):
                     m.next = "Data-Interrupt"
 
             with m.State("Data-Interrupt"):
@@ -1034,8 +1068,9 @@ class AnalyzerComponent(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.core = core = AnalyzerCore(
-            pins=self._pins, dram_range=self._dram_range, burst_bytes=32)
+        core_reset = Signal()
+        m.submodules.core = core = ResetInserter(core_reset)(AnalyzerCore(
+            pins=self._pins, dram_range=self._dram_range, burst_bytes=32))
         wiring.connect(m, core.dram, self._dram_bus)
 
         m.submodules.handler = handler  = CommandHandler(
@@ -1044,12 +1079,11 @@ class AnalyzerComponent(wiring.Component):
             data_width=len(self._pins), data_stride=1 << ceil_log2(len(self._pins)),
         )
         m.d.comb += [
-            core.divisor.eq(128),
-            # core.readout.eq(handler.readout),
-            core.readout.prolog_size.eq(128),
-            core.readout.epilog_size.eq(128),
+            core.divisor.eq(handler.divisor),
+            core.readout.eq(handler.readout),
             core.trigger.eq(handler.trigger),
             # TODO: cfg_update, interrupt
+            core_reset.eq(handler.cfg_update | handler.interrupt),
         ]
 
         m.submodules.parser = parser = CommandParser()
@@ -1081,6 +1115,7 @@ class AnalyzerInterface:
             pins=ports.pins, dram_bus=dram_bus, dram_range=dram_range))
         self._pipe = assembly.add_inout_pipe(
             component.o_stream, component.i_stream, in_flush=component.o_flush)
+        self._xdebug = assembly.add_ro_register(xdebug)
 
     def _log(self, message: str, *args):
         self._logger.log(self._level, "analyzer: " + message, *args)
@@ -1124,8 +1159,23 @@ class AnalyzerApplet(GlasgowAppletV2):
         )
 
     async def run(self, args):
+        def pvalue(x):
+            v = []
+            for mem, sh in x.shape().members.items():
+                v.append(f"{mem}={getattr(x,mem):{'#x' if Shape.cast(sh).width > 1 else ''}}")
+            return ", ".join(v)
+
+        async def poll_debug():
+            while True:
+                print(pvalue(await self.analyzer_iface._xdebug.get()))
+                await asyncio.sleep(1)
+
+        a = asyncio.create_task(poll_debug())
+
         endpoint = await ServerEndpoint("socket", self.logger, args.endpoint)
         await endpoint.attach_to_pipe(self.analyzer_iface._pipe)
+
+        a = a
 
     @classmethod
     def tests(cls):
