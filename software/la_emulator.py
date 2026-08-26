@@ -13,6 +13,7 @@ from glasgow.gateware import cobs
 
 logger = logging.getLogger("ols")
 pyLogging.basicConfig(level=0)
+logging.dump_hex.limit = None
 
 
 class Command(enum.Enum, shape=8):
@@ -45,7 +46,7 @@ class Analyzer:
     prolog_size: int = buffer_size >> 1
     epilog_size: int = buffer_size >> 1
     streaming: bool = False
-    sample_width: int = 7
+    sample_width: int = 8
 
     trigger_offset: int = 0
     acquire_task: asyncio.Task | None = None
@@ -58,19 +59,25 @@ class Analyzer:
         assert self.prolog_size + self.epilog_size <= self.buffer_size
 
     # 𝑁(𝑆) → (𝑝, 𝑆′)
-    def make_buffer(self, length):
+    def make_buffer(self, length, one_at=-10):
         buffer = bytearray()
-        val = 1
+        # val = 1
+        # for i in range(length):
+        #     buffer.append(i&0xff)
+        #     val = (val * 157 + 3) & 0xFF
         for i in range(length):
-            buffer.append(i&0xff)
-            val = (val * 157 + 3) & 0xFF
+            if one_at+0 == i: buffer.append(0x21)
+            elif one_at+1 == i: buffer.append(0x22)
+            elif one_at+2 == i: buffer.append(0x24)
+            elif one_at+3 == i: buffer.append(0x28)
+            else: buffer.append(0x20)
         return buffer
 
     async def generate(self, endpoint):
         trailer = struct.pack("B", 0x80 + self.trigger_offset)
-        self.trigger_offset = (self.trigger_offset + 1) % 4
+        self.trigger_offset = (self.trigger_offset + self.sample_stride) % 32
 
-        prolog = self.make_buffer(self.prolog_size * 4)
+        prolog = self.make_buffer(self.prolog_size * 4, self.prolog_size * 4 - 4)
         await endpoint.send(cobs.encode(b"\x01" + prolog + trailer) + b"\x00")
         if self.epilog_size > 1000:
             epilog = self.make_buffer(1000 * 4)
@@ -155,12 +162,12 @@ async def handle(analyzer, endpoint, command, argument):
         case _:
             logger.error(f"unknown command {command:02x}")
 
-    assert False
+    return None
 
 
 async def main():
     analyzer = Analyzer()
-    endpoint = await ServerEndpoint("analyzer", logger, ("tcp", "", 5556))
+    endpoint = await ServerEndpoint("analyzer", logger, ("tcp", "", 5555))
 
     while True:
         try:

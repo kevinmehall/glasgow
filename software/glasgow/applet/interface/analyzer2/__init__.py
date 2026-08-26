@@ -30,19 +30,15 @@ __all__ = ["AnalyzerCore", "AnalyzerComponent"]
 
 xdebug = Signal(data.StructLayout({
     "r_addr": 32,
-    "r_pend": 16,
-    "r_levl": 16,
+    # "r_pend": 16,
+    # "r_levl": 16,
     "w_addr": 32,
-    "w_pend": 16,
-    "w_levl": 16,
+    # "w_pend": 16,
+    # "w_levl": 16,
     "overflow": 1,
     "free_run": 1,
-    "arb_mode": 1,
     "credits":  32,
-}))
-
-tdebug = Signal(data.StructLayout({
-    "mode": data.ArrayLayout(3, 32),
+    "queue_size": 32,
 }))
 
 
@@ -69,14 +65,16 @@ class Sampler(wiring.Component):
         m.submodules.i_buf = i_buf = io.FFBuffer("i", self._pins)
         # m.d.comb += self.o_samples.p.data.eq(i_buf.i)
 
-        seq = Signal(range(256))
+        seq = Signal(range(5001), init=5000)
         with m.If(self.o_samples.valid):
-            m.d.sync += seq.eq(seq + 1)
-            m.d.sync += self.o_samples.p.data.eq(Mux(seq == 128, 0x21, 0x20))
+            # m.d.sync += self.o_samples.p.data.eq(Mux(seq == 1000, 0x21, 0x20))
+            m.d.sync += self.o_samples.p.data.eq(self.o_samples.p.data + 1)
 
         timer = Signal.like(self.divisor)
         with m.If(timer == 0):
-            m.d.comb += self.o_samples.valid.eq(1)
+            with m.If(seq > 0):
+                m.d.sync += seq.eq(seq - 1)
+            m.d.comb += self.o_samples.valid.eq(seq != 0)
             m.d.sync += timer.eq(self.divisor)
         with m.Else():
             m.d.sync += timer.eq(timer - 1)
@@ -155,7 +153,8 @@ class Trigger(wiring.Component):
         with m.If(fsm.ongoing("Forced")):
             m.d.comb += self.o_samples.p.trig.eq(1)
 
-        m.d.comb += tdebug.mode.eq(self.control)
+        m.d.comb += platform.request("led", 2).o.eq(self.o_samples.p.trig)
+        m.d.comb += platform.request("led", 0).o.eq(self.o_samples.p.data[15])
 
         return m
 
@@ -349,12 +348,12 @@ class Writer(wiring.Component):
                        self.i_packed.p.meta.complete)
         with m.If((((w_pointer + next_level_bytes) & (self._burst_bytes - 1)) == 0) |
                   flush_block):
-            with m.If(w_queue.i.valid & w_queue.i.ready & block_queue.i.ready):
+            with m.If(w_queue.i.valid & w_queue.i.ready):
                 m.d.comb += w_advance.eq(next_level_bytes)
 
         m.d.sync += xdebug.w_addr.eq(w_pointer)
-        m.d.sync += xdebug.w_pend.eq(w_pending)
-        m.d.sync += xdebug.w_levl.eq(w_queue.level)
+        # m.d.sync += xdebug.w_pend.eq(w_pending)
+        # m.d.sync += xdebug.w_levl.eq(w_queue.level)
 
         return m
 
@@ -404,7 +403,7 @@ class Reader(wiring.Component):
             # Convert 2-byte memory beats into output octets.
             with m.State("Data"):
                 r_phase = Signal()
-                r_count = Signal.like(self.i_blocks.p.size)
+                r_count = Signal.like(block_queue.o.p.size)
                 m.d.comb += [
                     self.o_octets.p.data.eq(r_queue.o.payload[r_phase]),
                     self.o_octets.valid.eq(block_queue.o.valid & r_queue.o.valid),
@@ -502,8 +501,8 @@ class Reader(wiring.Component):
                         m.next = "Idle"
 
         m.d.sync += xdebug.r_addr.eq(r_pointer)
-        m.d.sync += xdebug.r_pend.eq(r_pending)
-        m.d.sync += xdebug.r_levl.eq(r_queue.level)
+        # m.d.sync += xdebug.r_pend.eq(r_pending)
+        # m.d.sync += xdebug.r_levl.eq(r_queue.level)
 
         return m
 
@@ -531,13 +530,11 @@ class Arbiter(wiring.Component):
                 wiring.connect(m, flipped(self.writer.commands), flipped(self.dram.commands))
                 with m.If(~self.writer.commands.valid & self.reader.commands.valid):
                     m.next = "Reader"
-                m.d.sync += xdebug.arb_mode.eq(0)
 
             with m.State("Reader"):
                 wiring.connect(m, flipped(self.reader.commands), flipped(self.dram.commands))
                 with m.If(~self.reader.commands.valid):
                     m.next = "Writer"
-                m.d.sync += xdebug.arb_mode.eq(1)
 
         return m
 
@@ -679,7 +676,10 @@ class Readout(wiring.Component):
             with m.State("Pre-Trigger/Skip"):
                 m.d.comb += self.free_run.eq(1)
                 with m.If(queue_size <= self.control.prolog_size):
-                    m.next = "Pre-Trigger/Write"
+                    with m.If(saved_meta.trigger):
+                        m.next = "Fencepost"
+                    with m.Else():
+                        m.next = "Pre-Trigger/Write"
                 with m.Else():
                     m.d.comb += [
                         self.r_blocks.p.skip.eq(1),
@@ -687,7 +687,7 @@ class Readout(wiring.Component):
                         self.r_blocks.valid.eq(1),
                     ]
                     with m.If(self.r_blocks.valid & self.r_blocks.ready):
-                        with m.If(saved_meta.trigger | saved_meta.overflow | saved_meta.complete):
+                        with m.If(saved_meta.trigger):
                             m.next = "Fencepost"
                         with m.Else():
                             m.next = "Pre-Trigger/Write"
@@ -724,6 +724,8 @@ class Readout(wiring.Component):
                     with m.If(self.r_blocks.valid & self.r_blocks.ready):
                         m.next = "Pre-Trigger/Write"
 
+        m.d.sync += xdebug.queue_size.eq(queue_size)
+
         return m
 
 
@@ -738,6 +740,8 @@ class AnalyzerCore(wiring.Component):
         "end":  1,
     })))
 
+    interrupt: In(1)
+
     def __init__(self, *, pins: io.PortLike, dram_range: range, burst_bytes: int):
         self._pins = pins
 
@@ -749,7 +753,7 @@ class AnalyzerCore(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.sampler = sampler = Sampler(self._pins)
+        m.submodules.sampler = sampler = ResetInserter(self.interrupt)(Sampler(self._pins))
         m.d.comb += sampler.divisor.eq(self.divisor)
 
         m.submodules.trigger = trigger = Trigger()
@@ -768,20 +772,20 @@ class AnalyzerCore(wiring.Component):
         wiring.connect(m, arbiter.writer, writer.dram)
         wiring.connect(m, arbiter.reader, reader.dram)
 
-        m.submodules.flow_ctrl = flow_ctrl = FlowControl(
+        m.submodules.flow_ctrl = flow_ctrl = ResetInserter(self.interrupt)(FlowControl(
             writer_shape=writer.i_packed.p.shape(),
             writer_ratio=len(writer.i_packed.p.data),
             reader_shape=reader.o_octets.p.shape(),
             reader_ratio=1,
             max_credits=len(self._dram_range),
-        )
+        ))
         wiring.connect(m, packer.o_packed, flow_ctrl.i_writer)
         wiring.connect(m, flow_ctrl.o_writer, writer.i_packed)
         wiring.connect(m, reader.o_octets, flow_ctrl.i_reader)
 
-        m.submodules.readout = readout = Readout(
+        m.submodules.readout = readout = ResetInserter(self.interrupt)(Readout(
             dram_range=self._dram_range, burst_bytes=self._burst_bytes,
-            sample_stride=packer.stride)
+            sample_stride=packer.stride))
         m.d.comb += readout.control.eq(self.readout)
         wiring.connect(m, writer.o_blocks, readout.w_blocks)
         wiring.connect(m, readout.r_blocks, reader.i_blocks)
@@ -1045,7 +1049,6 @@ class OutputMultiplexer(wiring.Component):
                         with m.If(self.i_stream_cmd.valid & (data_index == 3)):
                             m.next = "Data-Interrupt"
                 with m.Elif(self.i_stream_cmd.valid & (data_index == 0)):
-                # with m.Elif(data_index == 0):
                     m.next = "Data-Interrupt"
 
             with m.State("Data-Interrupt"):
@@ -1083,9 +1086,8 @@ class AnalyzerComponent(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
-        core_reset = Signal()
-        m.submodules.core = core = ResetInserter(core_reset)(AnalyzerCore(
-            pins=self._pins, dram_range=self._dram_range, burst_bytes=32))
+        m.submodules.core = core = AnalyzerCore(
+            pins=self._pins, dram_range=self._dram_range, burst_bytes=32)
         wiring.connect(m, core.dram, self._dram_bus)
 
         m.submodules.handler = handler  = CommandHandler(
@@ -1097,8 +1099,7 @@ class AnalyzerComponent(wiring.Component):
             core.divisor.eq(handler.divisor),
             core.readout.eq(handler.readout),
             core.trigger.eq(handler.trigger),
-            # TODO: cfg_update, interrupt
-            core_reset.eq(handler.cfg_update | handler.interrupt),
+            core.interrupt.eq(handler.cfg_update | handler.interrupt),
         ]
 
         m.submodules.parser = parser = CommandParser()
@@ -1131,7 +1132,6 @@ class AnalyzerInterface:
         self._pipe = assembly.add_inout_pipe(
             component.o_stream, component.i_stream, in_flush=component.o_flush)
         self._xdebug = assembly.add_ro_register(xdebug)
-        self._tdebug = assembly.add_ro_register(tdebug)
 
     def _log(self, message: str, *args):
         self._logger.log(self._level, "analyzer: " + message, *args)
@@ -1187,7 +1187,6 @@ class AnalyzerApplet(GlasgowAppletV2):
         async def poll_debug():
             while True:
                 print(pvalue(await self.analyzer_iface._xdebug.get()))
-                print(pvalue(await self.analyzer_iface._tdebug.get()))
                 await asyncio.sleep(1)
 
         a = asyncio.create_task(poll_debug())

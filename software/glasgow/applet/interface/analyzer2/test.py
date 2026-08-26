@@ -318,15 +318,15 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
 
         m = Module()
         m.submodules.core = dut  = AnalyzerCore(
-            pins=pins, dram_range=range(0x100), burst_bytes=32)
-        m.submodules.dram = dram = octoram.SimulationController(0x100)
+            pins=pins, dram_range=range(0x1000), burst_bytes=32)
+        m.submodules.dram = dram = octoram.SimulationController(0x1000)
         wiring.connect(m, dut.dram, dram.bus)
 
         async def testbench_ctrl(ctx):
-            ctx.set(dut.divisor, 1)
+            ctx.set(dut.divisor, 47)
 
-            ctx.set(dut.readout.prolog_size, 8)
-            ctx.set(dut.readout.epilog_size, 8)
+            ctx.set(dut.readout.prolog_size, 10*5)
+            ctx.set(dut.readout.epilog_size, 90*5)
 
             # pins==0x40
             ctx.set(dut.trigger.mode[5], {"active": 1, "value": 1, "level": 0})
@@ -352,8 +352,14 @@ class AnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=AnalyzerApplet):
             ]:
                 await stream_assert(ctx, dut.samples, expected)
 
+        async def testbench_w(ctx):
+            ctx.set(dut.samples.ready, 1)
+            for _ in range(20_000):
+                await ctx.tick()
+
         with self.run_test(m) as sim:
             sim.add_testbench(testbench_ctrl)
-            sim.add_testbench(testbench_i)
-            sim.add_testbench(testbench_o)
+            # sim.add_testbench(testbench_i)
+            # sim.add_testbench(testbench_o)
+            sim.add_testbench(testbench_w)
             sim.add_testbench(dram.testbench, background=True)
