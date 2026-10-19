@@ -13,19 +13,21 @@ from glasgow.gateware import cobs
 
 logger = logging.getLogger("ols")
 pyLogging.basicConfig(level=0)
-logging.dump_hex.limit = None
+#logging.dump_hex.limit = None
 
 
 class Command(enum.Enum, shape=8):
     IDENTIFY            = 0b10_000000
     GET_CLK_FREQUENCY   = 0b10_000001
     SET_CLK_DIVISOR     = 0b01_000010
+    GET_CLK_DIVISOR     = 0b10_000010
     GET_BUFFER_SIZE     = 0b10_000011
     SET_PROLOG_SIZE     = 0b01_000100
     SET_EPILOG_SIZE     = 0b01_000101
     GET_DATA_FORMAT     = 0b10_000110
     SET_TRIGGER         = 0b01_010000
     GET_TRIGGER         = 0b10_010000
+    GET_METADATA        = 0b10_010001
     SYNCHRONIZE         = 0b11_011111
 
     ARM_TRIGGER         = 0b00_000000
@@ -47,16 +49,21 @@ class Analyzer:
     epilog_size: int = buffer_size >> 1
     streaming: bool = False
     sample_width: int = 8
+    stride: int = 1 << ceil_log2(sample_width)
+    min_divisor_value = max(-1, 2 * stride // 32 - 1) + 1
+    max_divisor_value = (1 << 24) - 1
 
     trigger_offset: int = 0
     acquire_task: asyncio.Task | None = None
+
+    metadata_response: str | None = None
 
     @property
     def sample_stride(self) -> int:
         return 1 << ceil_log2(self.sample_width)
 
     def check(self):
-        assert self.prolog_size + self.epilog_size <= self.buffer_size
+        assert self.prolog_size <= self.buffer_size
 
     # 𝑁(𝑆) → (𝑝, 𝑆′)
     def make_buffer(self, length, one_at=-10):
@@ -92,6 +99,7 @@ class Analyzer:
                 await asyncio.sleep(0.1)
                 epilog = self.make_buffer(10240)
                 await endpoint.send(cobs.encode(b"\x01" + epilog + b"\x00") + b"\x00")
+        await endpoint.send(cobs.encode(b"\x01\xC0") + b"\x00")
 
     def start(self, endpoint):
         self.stop()
@@ -112,7 +120,10 @@ async def handle(analyzer, endpoint, command, argument):
             return analyzer.clk_frequency
 
         case Command.SET_CLK_DIVISOR:
-            analyzer.clk_divisor = argument
+            analyzer.clk_divisor = min(analyzer.max_divisor_value, max(analyzer.min_divisor_value, argument))
+
+        case Command.GET_CLK_DIVISOR:
+            return analyzer.clk_divisor
 
         case Command.GET_BUFFER_SIZE:
             return analyzer.buffer_size
@@ -125,13 +136,17 @@ async def handle(analyzer, endpoint, command, argument):
             analyzer.streaming = bool(argument & 0x80000000)
 
         case Command.GET_DATA_FORMAT:
-            return analyzer.sample_width | (analyzer.sample_stride << 8)
+            return 0x49440000 | analyzer.sample_width | (analyzer.sample_stride << 8)
 
         case Command.SET_TRIGGER:
             pass
 
         case Command.GET_TRIGGER:
             return 0x49534142 # BASI
+
+        case Command.GET_METADATA:
+            analyzer.metadata_response = b"A\0B\0C\0D\0E\0F\0G\0H\0"
+            return 0x454d414e #NAME
 
         case Command.ARM_TRIGGER:
             analyzer.check()
@@ -180,6 +195,10 @@ async def main():
             print(analyzer)
             if command & 0x80:
                 await endpoint.send(cobs.encode(struct.pack("<BL", 0, result)) + b"\x00")
+            if analyzer.metadata_response is not None:
+                await endpoint.send(cobs.encode(b"\x02" + analyzer.metadata_response) + b"\x00")
+                analyzer.metadata_response = None
+
         except EOFError:
             pass
 
